@@ -1,4 +1,5 @@
 import os
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -9,16 +10,10 @@ from .routers import measurements as measurements_router
 from .routers.sensors import router as sensors_router
 from .errors import setup_error_handlers
 
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
+ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",")]
 
-app = FastAPI(title="Measurements API (FastAPI + SQLite)")
+app = FastAPI(title="Measurements API")
 setup_error_handlers(app)
-
-
-@app.get("/health", tags=["meta"])
-def health():
-    return {"status": "ok", "version": "1.0.0"}
-
 
 app.add_middleware(
     CORSMiddleware,
@@ -26,6 +21,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Total-Count"],
 )
 
 

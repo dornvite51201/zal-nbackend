@@ -1,7 +1,7 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 from sqlmodel import Session, select
 
@@ -12,7 +12,10 @@ from ..models import Measurement, Series, Sensor
 router = APIRouter(prefix="/measurements", tags=["measurements"])
 
 
-# ---------- Schemy Pydantic (request/response) ----------
+def to_utc(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 class MeasurementBase(BaseModel):
@@ -20,14 +23,15 @@ class MeasurementBase(BaseModel):
     value: float
     timestamp: datetime
 
+    def as_utc(self):
+        return to_utc(self.timestamp)
+
 
 class MeasurementCreate(MeasurementBase):
-    """Pełne dane potrzebne do utworzenia / zastąpienia pomiaru."""
     pass
 
 
 class MeasurementUpdate(BaseModel):
-    """Częściowa aktualizacja (PATCH)."""
     series_id: Optional[int] = None
     value: Optional[float] = None
     timestamp: Optional[datetime] = None
@@ -41,15 +45,8 @@ class MeasurementRead(MeasurementBase):
 
 
 class SensorMeasurementCreate(BaseModel):
-    """Dane wysyłane przez sensor.
-
-    series_id NIE jest tu podawane – jest powiązane z sensorem.
-    """
     value: float
     timestamp: Optional[datetime] = None
-
-
-# ---------- Pomocnicza walidacja zakresu ----------
 
 
 def _ensure_value_in_range(session: Session, series_id: int, value: float) -> Series:
@@ -67,82 +64,51 @@ def _ensure_value_in_range(session: Session, series_id: int, value: float) -> Se
     return series
 
 
-# ---------- Endpointy ----------
-
-
 @router.get("", response_model=List[MeasurementRead])
 def list_measurements(
     session: Session = Depends(get_session),
-    series_id: Optional[int] = Query(
-        None, description="Filtr po ID serii"
-    ),
-    ts_from: Optional[datetime] = Query(
-        None, description="Początek zakresu czasu (>= ts_from)"
-    ),
-    ts_to: Optional[datetime] = Query(
-        None, description="Koniec zakresu czasu (<= ts_to)"
-    ),
-    # aliasy dla zgodności wstecznej (opcjonalne)
-    since: Optional[datetime] = Query(
-        None, description="DEPRECATED: użyj ts_from"
-    ),
-    until: Optional[datetime] = Query(
-        None, description="DEPRECATED: użyj ts_to"
-    ),
-    limit: int = Query(
-        200, ge=1, le=1000, description="Limit wyników"
-    ),
-    offset: int = Query(
-        0, ge=0, description="Przesunięcie (paginacja)"
-    ),
+    series_id: Optional[int] = Query(None),
+    ts_from: Optional[datetime] = Query(None),
+    ts_to: Optional[datetime] = Query(None),
+    since: Optional[datetime] = Query(None),
+    until: Optional[datetime] = Query(None),
+    limit: int = Query(200, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
 ):
-    """
-    Lista pomiarów.
-
-    - filtrowanie po `series_id`
-    - filtrowanie po czasie (`ts_from` / `ts_to`)
-    - poprawne kody HTTP, sortowanie po timestamp rosnąco
-    """
     start = ts_from or since
     end = ts_to or until
 
-    stmt = select(Measurement)
+    if start:
+        start = to_utc(start)
+    if end:
+        end = to_utc(end)
 
+    stmt = select(Measurement)
     if series_id is not None:
         stmt = stmt.where(Measurement.series_id == series_id)
     if start is not None:
         stmt = stmt.where(Measurement.timestamp >= start)
     if end is not None:
         stmt = stmt.where(Measurement.timestamp <= end)
-
-    stmt = (
-        stmt.order_by(Measurement.timestamp.asc())
-        .offset(offset)
-        .limit(limit)
-    )
+    stmt = stmt.order_by(Measurement.timestamp.asc()).offset(offset).limit(limit)
     return session.exec(stmt).all()
 
 
 @router.post(
     "",
     response_model=MeasurementRead,
+    status_code=status.HTTP_201_CREATED,
     dependencies=[Depends(require_admin)],
 )
 def create_measurement(
     data: MeasurementCreate,
     session: Session = Depends(get_session),
 ):
-    """
-    Utworzenie nowego pomiaru (tylko admin).
-
-    Walidacja min/max na podstawie serii.
-    """
     _ensure_value_in_range(session, data.series_id, data.value)
-
     obj = Measurement(
         series_id=data.series_id,
         value=data.value,
-        timestamp=data.timestamp,
+        timestamp=data.as_utc(),
     )
     session.add(obj)
     session.commit()
@@ -160,22 +126,13 @@ def replace_measurement(
     data: MeasurementCreate,
     session: Session = Depends(get_session),
 ):
-    """
-    Pełne zastąpienie istniejącego pomiaru (PUT).
-
-    - wymaga kompletnych danych MeasurementCreate,
-    - walidacja min/max.
-    """
     obj = session.get(Measurement, measurement_id)
     if not obj:
         raise HTTPException(status_code=404, detail="Measurement not found")
-
     _ensure_value_in_range(session, data.series_id, data.value)
-
     obj.series_id = data.series_id
     obj.value = data.value
-    obj.timestamp = data.timestamp
-
+    obj.timestamp = data.as_utc()
     session.add(obj)
     session.commit()
     session.refresh(obj)
@@ -192,24 +149,21 @@ def update_measurement(
     data: MeasurementUpdate,
     session: Session = Depends(get_session),
 ):
-    """
-    Częściowa aktualizacja (PATCH).
-
-    Też waliduje min/max, jeśli zmieniamy serię lub wartość.
-    """
     obj = session.get(Measurement, measurement_id)
     if not obj:
         raise HTTPException(status_code=404, detail="Measurement not found")
 
     payload = data.model_dump(exclude_unset=True)
-
     new_series_id = payload.get("series_id", obj.series_id)
     new_value = payload.get("value", obj.value)
 
     _ensure_value_in_range(session, new_series_id, new_value)
 
-    for field, value in payload.items():
-        setattr(obj, field, value)
+    if "timestamp" in payload and payload["timestamp"] is not None:
+        payload["timestamp"] = to_utc(payload["timestamp"])
+
+    for k, v in payload.items():
+        setattr(obj, k, v)
 
     session.add(obj)
     session.commit()
@@ -226,10 +180,6 @@ def delete_measurement(
     measurement_id: int,
     session: Session = Depends(get_session),
 ):
-    """
-    Usunięcie pomiaru (tylko admin).
-    204 – brak treści, jeśli OK.
-    """
     obj = session.get(Measurement, measurement_id)
     if not obj:
         return
@@ -240,24 +190,16 @@ def delete_measurement(
 @router.post(
     "/from-sensor",
     response_model=MeasurementRead,
+    status_code=status.HTTP_201_CREATED,
 )
 def create_measurement_from_sensor(
     data: SensorMeasurementCreate,
     sensor: Sensor = Depends(get_sensor),
     session: Session = Depends(get_session),
 ):
-    """
-    Endpoint dla autonomicznych sensorów.
-
-    - autoryzacja przez nagłówek X-Sensor-Key
-    - sensor przypisany do jednej serii (sensor.series_id)
-    - timestamp opcjonalny (domyślnie bieżący czas)
-    - walidacja min/max na podstawie serii
-    """
-    ts = data.timestamp or datetime.utcnow()
-
+    ts = data.timestamp or datetime.now(timezone.utc)
+    ts = to_utc(ts)
     _ensure_value_in_range(session, sensor.series_id, data.value)
-
     obj = Measurement(
         series_id=sensor.series_id,
         value=data.value,

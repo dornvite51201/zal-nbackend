@@ -66,5 +66,5 @@ def create_sensor(
     session.commit()
     session.refresh(sensor)
 
-    # api_key pokazujemy tylko przy tworzeniu
+
     return SensorWithKey.model_validate(sensor)
